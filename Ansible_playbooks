@@ -1,0 +1,204 @@
+Node creation: 
+
+- hosts: iaas
+  roles:
+    - role: ../roles/azkaban/create_node
+
+Setup file:
+
+- hosts: instances
+  become: yes
+  become_method: sudo
+
+  vars_files:
+    - "../vars/azkaban/fstream-vars.yml"
+
+  roles:
+    - role: ../roles/azkaban/paas
+    - role: ../roles/azkaban/setup_azkaban
+    - role: ../roles/setup_spark
+    - role: ../roles/azkaban/config_update
+    - role: ../roles/azkaban/log_rotation
+    - role: ../roles/azkaban/create_project
+
+Roles:
+
+create_node:
+
+- name: create new instance
+  command: kloud-cli --zone in-chennai-1 instance create --type={{machineType}} --appId={{appId}} --image={{debainVersion}} --reservationId={{rev_id}} --user={{iaasuser}} --password={{iaaspass}}
+  register: instanceCreationOutput
+  tags:
+    - create_node
+- set_fact:
+    temp: "{{ instanceCreationOutput.stderr_lines | join }}"
+  tags:
+    - create_node
+- set_fact:
+    instanceId: "{{  temp | regex_replace('.*id: (.*)', '\\1')  }}"
+  tags:
+    - create_node
+- debug: var=instanceId
+  tags:
+    - create_node
+- name: sleep for 10 seconds
+  pause: seconds=10
+  tags:
+    - create_node
+- name: getting ip from instanceId
+  command: kloud-cli -z in-chennai-1 instance --appId={{appId}} describe --instanceId={{instanceId}}
+  register: instanceIpOutput
+  tags:
+    - create_node
+- set_fact:
+    temp: "{{ instanceIpOutput.stdout_lines | join }}"
+  tags:
+    - create_node
+- set_fact:
+    instanceIp: "{{  temp | regex_replace('.*primary_ip: (.*)reservation.*', '\\1')  }}"
+  tags:
+    - create_node
+- debug: var=instanceIp
+  tags:
+    - create_node
+- name: Add host {{instanceIp}} to group 'instances'
+  add_host:
+    name: '{{ instanceIp }}'
+    groups:
+    - instances
+  tags:
+    - create_node
+- name: Add host {{instanceIp}} to group 'instances'
+  add_host:
+    name: '{{ instanceIp }}'
+    groups:
+      - gw
+  when: instanceIp is defined
+  tags:
+    - executor
+- name: Wait for host
+  wait_for:
+    host: "{{ instanceIp }}"
+    port: 22
+    sleep: 10
+  tags:
+    - create_node
+- name: sleep for 60 seconds waiting for instance to get created.
+  pause: seconds=60
+  tags:
+    - create_node
+
+Config_update:
+- debug: var=result
+  tags:
+    - executor
+- set_fact:
+    configOutput: "{{ result.json.metadata.version }}"
+  tags:
+    - executor
+
+- debug: var=configOutput
+  tags:
+    - executor
+
+- name: Creating Payload to update the config bucket
+  template: src=config.json dest=/tmp/config.json
+  tags:
+    - executor
+
+- fetch:
+    src: /tmp/config.json
+    dest: /tmp/
+    flat: yes
+  tags:
+    - executor
+
+- uri:
+    url: http://{{conf_ip}}/v1/buckets/{{host_conf_bucket}}/keys?message="Addinghostentry"
+    user: '{{config_bucket_username}}'
+    password: '{{config_bucket_password}}'
+    method: POST
+    body: "{{ lookup('file','/tmp/config.json') }}"
+    force_basic_auth: yes
+    return_content: yes
+    body_format: json
+    headers:
+      X-Config-Bucket-Version: "{{configOutput}}"
+  tags:
+    - executor
+
+- name: Restart host populator
+  command: /etc/init.d/fk-ops-hosts-populator restart
+  tags:
+    - executor
+
+Create_project:
+
+# Create fstream projects in iaas. Use this only for setting up fstream executor. Proper tags are in place.
+- uri:
+    url: https://{{inventory_hostname}}:{{azkaban_port_no}}/?action=login&username={{azkaban_username}}&password={{azkaban_password}}
+    method: POST
+    return_content: yes
+    validate_certs: False
+  register: result
+  tags:
+    - fstream_webserver
+- set_fact:
+    configOutput: "{{result.json}}"
+  tags:
+    - fstream_webserver
+
+- debug: var=configOutput
+  tags:
+    - fstream_webserver
+- set_fact:
+    sessionId: "{{configOutput['session.id']}}"
+  tags:
+    - fstream_webserver
+- debug: var=sessionId
+  tags:
+    - fstream_webserver
+- debug: var=result
+  tags:
+    - fstream_webserver
+- uri:
+    url: https://{{inventory_hostname}}:8443/manager?action=create&session.id={{sessionId}}&name={{ item }}&description=Fstream%20project%20{{item}}
+    method: POST
+    return_content: yes
+    validate_certs: False
+  register: result
+  tags:
+    - fstream_webserver
+  loop: "{{ teamNamesList }}"
+
+- debug: var=result
+  tags:
+    - fstream_webserver
+
+
+DB-update:
+
+---
+- name: Create Database
+  shell: mysql -u {{mysql_user}} -p'{{mysql_pass}}' -e "CREATE DATABASE IF NOT EXISTS {{mysql_db}};"
+  tags:
+    - setup_db
+- name: Create tem directory
+  shell: mkdir -p /etc/tmp
+  tags:
+    - setup_db
+- name: Copy sql file
+  copy:
+    src: table_creation.sql
+    dest: /etc/tmp/table_creation.sql
+    mode: '0777'
+  tags:
+    - setup_db
+- name: Create tables
+  shell: mysql -u {{mysql_user}} -p'{{mysql_pass}}' {{mysql_db}} < /etc/tmp/table_creation.sql
+  tags:
+    - setup_db
+- name: remove sql file
+  shell: rm /etc/tmp/table_creation.sql
+  tags:
+    - setup_db
